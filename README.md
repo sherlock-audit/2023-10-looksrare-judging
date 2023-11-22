@@ -201,89 +201,11 @@ https://github.com/LooksRare/contracts-infiltration/pull/148
 
 https://github.com/LooksRare/contracts-infiltration/pull/164
 
-# Issue H-2: Incorrect bitmask used in _swap will lead to ids in agents mapping to be corrupted 
+**SergeKireev**
 
-Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/27 
+Fix LGTM
 
-## Found by 
-cergyk
-Infiltration smart contract uses a common pattern when handling deletion in arrays:
-Say we want to delete element i in array of length N:
-
-1/ We swap element at index i with element at index N-1
-2/ We update the length of the array to be N-1
-
-Infiltration uses `_swap()` method to do this with a twist:
-It updates the status of the removed agent to `Killed`, and initializes id of last agent if it is uninitialized. 
-
-There is a mistake in a bitmask value used for resetting the id of the last agent, which will mess up the game state.
-
-Lines of interest for reference:
-https://github.com/sherlock-audit/2023-10-looksrare/blob/main/contracts-infiltration/contracts/Infiltration.sol#L1582-L1592
-
-## Vulnerability Detail
-
-Let's take a look at the custom `assembly` block used to assign an id to the newly allocated `lastAgent`:
-
-```solidity
-assembly {
-    let lastAgentCurrentValue := sload(lastAgentSlot)
-    // Replace the last agent's ID with the current agent's ID.
---> lastAgentCurrentValue := and(lastAgentCurrentValue, not(AGENT__STATUS_OFFSET))
-    lastAgentCurrentValue := or(lastAgentCurrentValue, lastAgentId)
-    sstore(currentAgentSlot, lastAgentCurrentValue)
-
-    let lastAgentNewValue := agentId
-    lastAgentNewValue := or(lastAgentNewValue, shl(AGENT__STATUS_OFFSET, newStatus))
-    sstore(lastAgentSlot, lastAgentNewValue)
-}
-```
-
-The emphasized line shows that `not(AGENT__STATUS_OFFSET)` is used as a bitmask to set the `agentId` value to zero.
-However `AGENT__STATUS_OFFSET == 16`, and this means that instead of setting the low-end 2 bytes to zero, this will the single low-end fifth bit to zero. Since bitwise or is later used to assign lastAgentId, if the id in lastAgentCurrentValue is not zero, and is different from lastAgentId, the resulting value is arbitrary, and can cause the agent to be unrecoverable. 
-
-The desired value for the mask is `not(TWO_BYTES_BITMASK)`:
-
-```solidity
-    not(AGENT__STATUS_OFFSET) == 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffef
-    not(TWO_BYTES_BITMASK)    == 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000
-```
-
-## Impact
-The ids of the agents will be mixed, this could mean that some agents will be unrecoverable, or duplicated.
-Since the attribution of the grand prize relies on the `agentId` stored, we may consider that the legitimate winner can lose access to the prize.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-```diff
-assembly {
-    let lastAgentCurrentValue := sload(lastAgentSlot)
-    // Replace the last agent's ID with the current agent's ID.
--   lastAgentCurrentValue := and(lastAgentCurrentValue, not(AGENT__STATUS_OFFSET))
-+   lastAgentCurrentValue := and(lastAgentCurrentValue, not(TWO_BYTES_BITMASK))
-    lastAgentCurrentValue := or(lastAgentCurrentValue, lastAgentId)
-    sstore(currentAgentSlot, lastAgentCurrentValue)
-
-    let lastAgentNewValue := agentId
-    lastAgentNewValue := or(lastAgentNewValue, shl(AGENT__STATUS_OFFSET, newStatus))
-    sstore(lastAgentSlot, lastAgentNewValue)
-}
-```
-
-
-
-## Discussion
-
-**0xhiroshi**
-
-https://github.com/LooksRare/contracts-infiltration/pull/150
-
-# Issue H-3: Winning agent id may be uninitialized when game is over, locking grand prize 
+# Issue H-2: Winning agent id may be uninitialized when game is over, locking grand prize 
 
 Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/31 
 
@@ -351,7 +273,17 @@ function claimGrandPrize() external nonReentrant {
 
 https://github.com/LooksRare/contracts-infiltration/pull/153
 
-# Issue H-4: Attacker can steal reward of actual winner by force ending the game 
+**0xhiroshi**
+
+https://github.com/LooksRare/contracts-infiltration/pull/178
+
+@nevillehuang 
+
+**SergeKireev**
+
+Fix LGTM
+
+# Issue H-3: Attacker can steal reward of actual winner by force ending the game 
 
 Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/98 
 
@@ -497,7 +429,181 @@ Start a new Round before the real end of game to clear all wounded agents and re
 
 https://github.com/LooksRare/contracts-infiltration/pull/154
 
-# Issue M-1: Wound agent can't invoke heal in the next round 
+**SergeKireev**
+
+Fix LGTM
+
+# Issue M-1: Agents with Healing Opportunity Will Be Terminated Directly if The `escape` Reduces activeAgents to the Number of `NUMBER_OF_SECONDARY_PRIZE_POOL_WINNERS` or Fewer 
+
+Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/43 
+
+## Found by 
+Krace, SilentDefendersOfDeFi, detectiveking, mstpr-brainbot
+
+Wounded Agents face the risk of losing their last opportunity to heal and are immediately terminated if certain Active Agents decide to escape.
+
+## Vulnerability Detail
+
+In each round, agents have the opportunity to either `escape` or `heal` before the `_requestForRandomness` function is called. However, the order of execution between these two functions is not specified, and anyone can be executed at any time just before `startNewRound`. Typically, this isn't an issue. However, the problem arises when there are only a few Active Agents left in the game.
+
+On one hand, the `heal` function requires that the number of `gameInfo.activeAgents` is greater than `NUMBER_OF_SECONDARY_PRIZE_POOL_WINNERS`.
+
+```solidity
+    function heal(uint256[] calldata agentIds) external nonReentrant {
+        _assertFrontrunLockIsOff();
+//@audit If there are not enough activeAgents, heal is disabled
+        if (gameInfo.activeAgents <= NUMBER_OF_SECONDARY_PRIZE_POOL_WINNERS) {
+            revert HealingDisabled();
+        }
+```
+
+
+On the other hand, the `escape` function will directly set the status of agents to "ESCAPE" and reduce the count of `gameInfo.activeAgents`.
+
+```solidity
+   function escape(uint256[] calldata agentIds) external nonReentrant {
+        _assertFrontrunLockIsOff();
+
+        uint256 agentIdsCount = agentIds.length;
+        _assertNotEmptyAgentIdsArrayProvided(agentIdsCount);
+
+        uint256 activeAgents = gameInfo.activeAgents;
+        uint256 activeAgentsAfterEscape = activeAgents - agentIdsCount;
+        _assertGameIsNotOverAfterEscape(activeAgentsAfterEscape);
+
+        uint256 currentRoundAgentsAlive = agentsAlive();
+
+        uint256 prizePool = gameInfo.prizePool;
+        uint256 secondaryPrizePool = gameInfo.secondaryPrizePool;
+        uint256 reward;
+        uint256[] memory rewards = new uint256[](agentIdsCount);
+
+        for (uint256 i; i < agentIdsCount; ) {
+            uint256 agentId = agentIds[i];
+            _assertAgentOwnership(agentId);
+
+            uint256 index = agentIndex(agentId);
+            _assertAgentStatus(agents[index], agentId, AgentStatus.Active);
+
+            uint256 totalEscapeValue = prizePool / currentRoundAgentsAlive;
+            uint256 rewardForPlayer = (totalEscapeValue * _escapeMultiplier(currentRoundAgentsAlive)) /
+                ONE_HUNDRED_PERCENT_IN_BASIS_POINTS;
+            rewards[i] = rewardForPlayer;
+            reward += rewardForPlayer;
+
+            uint256 rewardToSecondaryPrizePool = (totalEscapeValue.unsafeSubtract(rewardForPlayer) *
+                _escapeRewardSplitForSecondaryPrizePool(currentRoundAgentsAlive)) / ONE_HUNDRED_PERCENT_IN_BASIS_POINTS;
+
+            unchecked {
+                prizePool = prizePool - rewardForPlayer - rewardToSecondaryPrizePool;
+            }
+            secondaryPrizePool += rewardToSecondaryPrizePool;
+
+            _swap({
+                currentAgentIndex: index,
+                lastAgentIndex: currentRoundAgentsAlive,
+                agentId: agentId,
+                newStatus: AgentStatus.Escaped
+            });
+
+            unchecked {
+                --currentRoundAgentsAlive;
+                ++i;
+            }
+        }
+
+        // This is equivalent to
+        // unchecked {
+        //     gameInfo.activeAgents = uint16(activeAgentsAfterEscape);
+        //     gameInfo.escapedAgents += uint16(agentIdsCount);
+        // }
+```
+
+Threrefore, if the `heal` function is invoked first then the corresponding Wounded Agents will be healed in function `fulfillRandomWords`. If the `escape` function is invoked first and the number of `gameInfo.activeAgents` becomes equal to or less than `NUMBER_OF_SECONDARY_PRIZE_POOL_WINNERS`, the `heal` function will be disable. This obviously violates the fairness of the game.
+
+**Example**
+
+Consider the following situation:
+
+After Round N, there are 100 agents alive. And, **1** Active Agent wants to `escape` and **10** Wounded Agents want to `heal`.
+- Round N: 
+  - Active Agents: 51
+  - Wounded Agents: 49
+  - Healing Agents: 0
+
+According to the order of execution, there are two situations.
+**Please note that the result is calculated only after `_healRequestFulfilled`, so therer are no new wounded or dead agents**
+
+First, invoking `escape` before `heal`. 
+`heal` is disable and all Wounded Agents are killed because there are not enough Active Agents.
+- Round N+1: 
+  - Active Agents: 50
+  - Wounded Agents: 0
+  - Healing Agents: 0
+ 
+Second, invoking `heal` before `escape`.
+Suppose that `heal` saves **5** agents, and we got:
+- Round N+1:
+  - Active Agents: 55
+  - Wounded Agents: 39
+  - Healing Agents: 0
+
+Obviously, different execution orders lead to drastically different outcomes, which affects the fairness of the game.
+
+## Impact
+
+If some Active Agents choose to escape, causing the count of `activeAgents` to become equal to or less than `NUMBER_OF_SECONDARY_PRIZE_POOL_WINNERS`, the Wounded Agents will lose their final chance to heal themselves. 
+
+This situation can significantly impact the game's fairness. The Wounded Agents would have otherwise had the opportunity to heal themselves and continue participating in the game. However, the escape of other agents leads to their immediate termination, depriving them of that chance.
+
+## Code Snippet
+
+Heal will be disabled if there are not enout activeAgents.
+[Infiltration.sol#L804](https://github.com/sherlock-audit/2023-10-looksrare/blob/main/contracts-infiltration/contracts/Infiltration.sol#L804)
+
+Escape will directly reduce the activeAgents.
+[Infiltration.sol#L769](https://github.com/sherlock-audit/2023-10-looksrare/blob/main/contracts-infiltration/contracts/Infiltration.sol#L769)
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+It is advisable to ensure that the `escape` function is always called after the `heal` function in every round. This guarantees that every wounded agent has the opportunity to heal themselves when there are a sufficient number of `activeAgents` at the start of each round. This approach can enhance fairness and gameplay balance.
+
+
+
+## Discussion
+
+**0xhiroshi**
+
+This is a valid PvP game strategy.
+
+**nevillehuang**
+
+I can see sponsors view of disputing these issues given this protocol focuses on a PVP game. The difference between this two #43 and #57  and issue [#98](https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/98) is because #98 actually triggers an invalid game state and [#84](https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/84) truly skews the odds, but #43 and #57 don't fall into either categories.
+
+However, due to a lack of concrete details on PVP strategies, I also see watsons point of view of how the use of `escape()` and `heal()` can cause unfair game mechanics. While I also understand the sponsor's view of difficulty in predicting PVP strategies, I think it could have been avoided by including this as potential risks in the accepted risks/known issues of sherlocks contest details (which is the source of truth for contest details).
+
+ As such, I am going to keep #43 and #57 as medium severity findings, given the attack path requires specific conditions that would otherwise have been valid PVP strategies.
+
+**0xhiroshi**
+
+We won't further dispute this issue and we won't fix it.
+
+**nevillehuang**
+
+After further considerations, going to mark this issue as invalid due to the analysis of the following [test](https://github.com/sherlock-audit/2023-10-looksrare/blob/main/contracts-infiltration/test/foundry/Infiltration.fulfillRandomWords.t.sol#L396). It supports the sponsor claim that instant killing of wounded agents once active agents fall below `NUMBER_OF_SECONDARY_PRIZE_POOL_WINNERS` (50) is a valid PVP strategy.
+
+1. It first simulates active agents falling to 51
+2. Then it attempts to heal 3 wounded agents (ids: 8534, 3214 and 6189)
+3. It then escapes 2 agents to make active agents fall below 49
+4. A new round is started, instantly killing all wounded agents
+
+Only #29 and #34 mentions the other root cause of instantly ending the game with `escape()` (which allows immediate claiming of grand prize) so this 2 issues will be dupped with #98.
+
+# Issue M-2: Wound agent can't invoke heal in the next round 
 
 Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/44 
 
@@ -589,7 +695,11 @@ Manual Review
 
 https://github.com/LooksRare/contracts-infiltration/pull/151
 
-# Issue M-2: Index values selected in `_woundRequestFulfilled()` are not uniformly distributed. 
+**SergeKireev**
+
+Fix LGTM
+
+# Issue M-3: Index values selected in `_woundRequestFulfilled()` are not uniformly distributed. 
 
 Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/84 
 
@@ -686,4 +796,323 @@ index 31af961..1c43c31 100644
 **0xhiroshi**
 
 https://github.com/LooksRare/contracts-infiltration/pull/152
+
+**SergeKireev**
+
+Fix LGTM
+
+# Issue M-4: fulfillRandomWords() could revert under certain circumstances 
+
+Source: https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/136 
+
+## Found by 
+ge6a, klaus, p-tsanev
+
+According the documentation of Chainlink VRF the max gas limit for the VRF coordinator is 2 500 000. This means that the max gas that fulfillRandomWords() can use is 2 500 000 and if it is exceeded the function would revert. I have constructed a proof of concept that demonstrates it is possible to have a scenario in which fulfillRandomWords reverts and thereby disrupts the protocol's work.
+
+## Vulnerability Detail
+
+Crucial part of my POC is the variable AGENTS_TO_WOUND_PER_ROUND_IN_BASIS_POINTS. I communicated with the protocol's team that they plan to set it to 20 initially but it is possible to have a different value for it in future. For the POC i used 30.
+
+```solidity
+function test_fulfillRandomWords_revert() public {
+        _startGameAndDrawOneRound();
+
+        _drawXRounds(48);
+        
+        uint256 counter = 0;
+        uint256[] memory wa = new uint256[](30);
+        uint256 totalCost = 0;
+
+        for (uint256 j=2; j <= 6; j++) 
+        {
+            (uint256[] memory woundedAgentIds, ) = infiltration.getRoundInfo({roundId: j});
+
+            uint256[] memory costs = new uint256[](woundedAgentIds.length);
+            for (uint256 i; i < woundedAgentIds.length; i++) {
+                costs[i] = HEAL_BASE_COST;
+                wa[counter] = woundedAgentIds[i];
+                counter++;
+                if(counter > 29) break;
+            }
+
+            if(counter > 29) break;
+        }
+        
+        
+        totalCost = HEAL_BASE_COST * wa.length;
+        looks.mint(user1, totalCost);
+
+        vm.startPrank(user1);
+        _grantLooksApprovals();
+        looks.approve(TRANSFER_MANAGER, totalCost);
+
+
+        infiltration.heal(wa);
+        vm.stopPrank();
+
+        _drawXRounds(1);
+    }
+```
+
+I put this test into Infiltration.startNewRound.t.sol and used --gas-report to see that the gas used for fulfillRandomWords exceeds 2 500 000.
+
+## Impact
+
+DOS of the protocol and inability to continue the game.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-10-looksrare/blob/main/contracts-infiltration/contracts/Infiltration.sol#L1096-L1249
+https://docs.chain.link/vrf/v2/subscription/supported-networks/#ethereum-mainnet
+https://docs.chain.link/vrf/v2/security#fulfillrandomwords-must-not-revert
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+A couple of ideas : 
+
+1) You can limit the value of AGENTS_TO_WOUND_PER_ROUND_IN_BASIS_POINTS to a small enough number so that it is 100% sure it will not reach the gas limit.
+
+2) Consider simply storing the randomness and taking more complex follow-on actions in separate contract calls as stated in the "Security Considerations" section of the VRF's docs. 
+
+
+
+## Discussion
+
+**nevillehuang**
+
+[Accepted risks](https://github.com/sherlock-audit/2023-10-looksrare#q-please-list-any-known-issuesacceptable-risks-that-should-not-result-in-a-valid-finding), the **KEYWORDS** here are: 
+- **periods of network congestion** --> this causes the hard code gas fallback to revert --> accepted risk
+- **Any reason causing randomness request to not be fufilled** --> If request for randomness is not fufilled due to ANY reason, even if highilighted in a submission, it is not a accepted finding since it is an accepted risk LooksRare are willing to take
+
+> In the case of extended periods of network congestion or any reason causing the randomness request not to be fulfilled, the contract owner is able to withdraw everything after approximately 36 hours.
+
+**gstoyanovbg**
+
+Escalate
+I disagree with the comment of @nevillehuang . Imagine a situation in which you start a game with 10,000 participants, go through many rounds, and at one point, the game stops and cannot continue. As far as I understand, the judge's claim is that the funds can be withdrawn after a certain time, which is true. However, will the gas fees be returned to all users who have healed agents or traded them on the open market in some way? And what about the time that the players have devoted to winning a game that suddenly stops due to a bug and cannot continue? Every player may have claims for significant missed benefits (and losses from gas fees). Now, imagine that this continues to happen again and again in some of the subsequent games. Will anyone even invest time and resources to play this game? My request to the judges is to review my report again because it has nothing to do with 'periods of network congestion' as stated and this issue is not listed under the "Accepted risks" section. 
+Thanks.
+P.S During the contest i discussed this with the sponsor and confirmed that this is an issue (probably doesn't matter but wanted to mention it)
+
+**sherlock-admin2**
+
+ > Escalate
+> I disagree with the comment of @nevillehuang . Imagine a situation in which you start a game with 10,000 participants, go through many rounds, and at one point, the game stops and cannot continue. As far as I understand, the judge's claim is that the funds can be withdrawn after a certain time, which is true. However, will the gas fees be returned to all users who have healed agents or traded them on the open market in some way? And what about the time that the players have devoted to winning a game that suddenly stops due to a bug and cannot continue? Every player may have claims for significant missed benefits (and losses from gas fees). Now, imagine that this continues to happen again and again in some of the subsequent games. Will anyone even invest time and resources to play this game? My request to the judges is to review my report again because it has nothing to do with 'periods of network congestion' as stated and this issue is not listed under the "Accepted risks" section. 
+> Thanks.
+> P.S During the contest i discussed this with the sponsor and confirmed that this is an issue (probably doesn't matter but wanted to mention it)
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**PlamenTSV**
+
+Escalate
+My issue 107 is the same and I agree with the above statement, as this is not an occurance that can randomly happen once, depending on potential parameter changes it can become extremely likely to happen every time. If every game has a high chance to get permanently dosed, even if emergency withdrawal is available, the game itself becomes unplayable.
+The accepted risks cover network congestion and the 36 period, but that period does not solve the insolvency, it just refunds some funds, not even everything that costed players and congestion is not the cause, but the badly gas optimized function. 
+
+**sherlock-admin2**
+
+ > Escalate
+> My issue 107 is the same and I agree with the above statement, as this is not an occurance that can randomly happen once, depending on potential parameter changes it can become extremely likely to happen every time. If every game has a high chance to get permanently dosed, even if emergency withdrawal is available, the game itself becomes unplayable.
+> The accepted risks cover network congestion and the 36 period, but that period does not solve the insolvency, it just refunds some funds, not even everything that costed players and congestion is not the cause, but the badly gas optimized function. 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+This is the only comment I will make about this submission, and I will leave the rest up to @nasri136 @Evert0x . 
+
+I agree this is a valid issue, but the fact is in the accepted risk section it mentions that ANY and i repeat ANY issue not just network congestion causing randomness request to fail is an accepted risk. If the game is not completed, then admin can always call `emergencyWithdraw()`, so as long as this function is not DoSed (which is not possible unless game has ended), then I am simply following sherlocks [rules](https://docs.sherlock.xyz/audits/judging/judging#iii.-some-standards-observed):
+
+> Hierarchy of truth: Contest README > Sherlock rules for valid issues > Historical decisions. 
+While considering the validity of an issue in case of any conflict the sources of truth are prioritized in the above order. 
+For example: In case of conflict between Sherlock rules vs Sherlock's historical decision,  Sherlock criteria for issues must be considered the source of truth. 
+In case of conflict between information in the README vs Sherlock rules, the README overrides Sherlock rules. 
+
+And yes private/discord messages does not matter: 
+
+> Discord messages or DM screenshots are not considered sources of truth while judging an issue/escalation especially if they are conflicting with the contest README.
+
+**gstoyanovbg**
+
+I understand your point. However, still believe that the 'Accepted Risks' section is not formulated well enough, and this case should definitely be excluded from its scope. I am aware of Sherlock's rules, but in my opinion, there are nuances even in them, and they cannot be 100% accurate for all situations. 
+I see that report #107 by @PlamenTSV, which is same issue as this, has labels "Sponsor Confirmed" and "Will fix." Also, @0xhiroshi has made a pull request for a fix which makes me happy because at the end of the day our goal is to have a secure, bug free protocol. However, it sounds strange to claim that a vulnerability is an "accepted risk" but at the same time to fix it.  Looking forward for the final decision of the judges. If you have any questions, I am ready to assist.
+
+**nevillehuang**
+
+@gstoyanovbg I totally get your point too and agree with you. If I didn’t have to follow sherlock rules, I would have side with the watsons and validated this finding. But the fact that in the accepted risks section they used the word ANY is too strong of a word for me to ignore.
+
+**PlamenTSV**
+
+Don't sherlock rules serve as a guideline?
+I hope most if not every watson that has read this issue agrees it is valid. The judges agree it is valid by severity and even the sponsors themselves want to fix it and deem it a valid finding.
+I think the reason the README is like this is because the protocol team did not expect that their protocol could have a DoS of this caliber - thus why they overlook the README and confirm the issue. It would be a shame to get robbed of a valid finding with no reward, worse ratio for the platform, but for the protocol to aknowledge and fix. There should be some kind of workaround for these kinds of scenarios. I believe that would be most fair and I hope you agree. If we could get a sherlock admin to give clarity to the situation it would be appreciated, thanks to everyone in the comments. 
+
+**PlamenTSV**
+
+> This is the only comment I will make about this submission, and I will leave the rest up to @nasri136 @Evert0x .
+> 
+> I agree this is a valid issue, but the fact is in the accepted risk section it mentions that ANY and i repeat ANY issue not just network congestion causing randomness request to fail is an accepted risk. If the game is not completed, then admin can always call `emergencyWithdraw()`, so as long as this function is not DoSed (which is not possible unless game has ended), then I am simply following sherlocks [rules](https://docs.sherlock.xyz/audits/judging/judging#iii.-some-standards-observed):
+> 
+> > Hierarchy of truth: Contest README > Sherlock rules for valid issues > Historical decisions.
+> > While considering the validity of an issue in case of any conflict the sources of truth are prioritized in the above order.
+> > For example: In case of conflict between Sherlock rules vs Sherlock's historical decision,  Sherlock criteria for issues must be considered the source of truth.
+> > In case of conflict between information in the README vs Sherlock rules, the README overrides Sherlock rules.
+> 
+> And yes private/discord messages does not matter:
+> 
+> > Discord messages or DM screenshots are not considered sources of truth while judging an issue/escalation especially if they are conflicting with the contest README.
+
+One thing to add while rereading this comment, shouldn't Sponsor final confirmation >>> contest readmi, exactly because some issue's severity can go overlooked, just like in the current case
+
+**nevillehuang**
+
+Afaik, Sponsor confirmation has never been the deciding factor for a finding. It has always been sherlock rules, contest details and the code itself. To note, this rules are introduce to ensure judging consistency in the first place.
+
+I agree that this finding is valid, and it is unfair to watsons for not being rewarded. But it is also very unfair to me for potentially having my judging points penalized because the source of ambiguity is not because of me. I think all watsons know judging is not easy, and the rules revolving judging is extremely strict. Even one miss finding by me will heavily penalize me.
+
+I leave this in the hands of @Evert0x @nasri136 and will respect any final outcome.
+
+**Czar102**
+
+First off, the status of whether the sponsor wants to fix the issue has nothing to do with its validity. Please don't use it as an argument of judgement.
+
+Secondly, I understand @nevillehuang about the strictness of the judging rules and potential payout issues. Will see what can I do about it in this case. The mechanism shouldn't bias you towards maintaining the current judgement, so if you have concerns with that, we can try to resolve those rewarding formula issues in DMs.
+
+About the issue, it is true that it is unfortunately conflicting with the README. I think we should rethink the way the docs describes the hierarchy of truth.
+
+Audits exist not only to show outright mistakes in the code. Auditors' role is to show that some properties (that are important to parties using the code) are not enforced or fulfilled. They need to think in a broader sense than the sponsors did, in order to provide any more insight above the technical one. Auditors need to teach sponsors not only about issues, but also about the impacts. "Why is this property a problem?"
+
+Sponsors can't know what wording to use not to exclude the bugs they don't care about. Because that's not their job. It's our job to understand their needs. We work for them to secure their code. We tell them what do they need.
+
+What sponsors probably meant by "any reason causing the randomness request not to be fulfilled" is most likely "any **external** reason causing the randomness request not to be fulfilled". They didn't think it could be their contract causing this issue. I think some Watsons correctly identified what sponsors intended to convey and should be rewarded for submitting the issue.
+
+Will alter the docs to account for this kind of situations.
+
+Could you share your feedback on the above approach? @nevillehuang @PlamenTSV @gstoyanovbg
+
+**PlamenTSV**
+
+I am glad you understand the aspect of the README file overlooking the potential issues. It is not that they do not accept issues like this, it is the fact that they did not expect their contract to be at fault for them.
+I believe us watsons did in fact identify a valid problem, adhering both to the sherlock criteria and the sponsor's needs (we understand their confirmation is not a valid judgement, but it can be an argument that they did a mistake in the README), and hopefully I am speaking for everyone when I say I am glad we reached such a fair outcome.
+I am looking forward to seeing some docs changes for edge-case scenarios like this so they can be more easily resolved in the future.
+Thanks for the hard work!
+
+**nevillehuang**
+
+Hi @Czar102, I will share with you how I interpreted this while judging. In addition to the conflicted READ.ME, the `emergencyWithdraw` function exists in the first place to deal with such scenarios, that is why i deemed it as an accepted risk since funds can always be rescued by trusted admins.
+
+While I also understand the other side of the equation, I will share with you what I think is the only possible fair outcome for both watsons auditing and judging. I also want to clarify that unfairness goes both ways, but arguably even more so for judging since judging has way stricter rules.
+
+> Hi all heres my input for the findings regarding 107 & 136. In my opinion, the only fair outcome for all parties for 107 & 136 is to validate the finding as medium severity and waive its potential impact on my judging status. After all, the finding has provided significant value to the sponsor given the fix implemented.
+> But you can see from the current judging state that there will likely be less than 10 issues, so one missed issue by me can lead to heavy penalisation of my judging points or maybe even lead me to not make the minimum 80% recall threshold.
+> I have included this in part of my growing list of suggestion for improvement to sherlock, that is we possibly need a period of 24-48 hour for sponsor to clarify/edit any doubts regarding contest details. Lead judge/head of judging can facilitate in this.
+> Of course this is just my opinion, I leave the rest up to the temporary head of judging and sherlock
+
+**gstoyanovbg**
+
+@Czar102, I agree with everything you've said, and I share your philosophy on the work of auditors. Regarding the rules for judging, in my opinion, they cannot cover all possible cases, especially those that have not arisen before. They should evolve over time, and in the event of a situation, the Sherlock team should be able to make a decision so that there are no affected judges and auditors. @nevillehuang, I still believe this is a high severity issue, but at the same time, it is not fair to be punished because you acted according to the defined rules. I hope a solution can be found.
+
+**Czar102**
+
+> the `emergencyWithdraw` function exists in the first place to deal with such scenarios
+
+Nevertheless, the contract doesn't function correctly. I think that because it is possible to rescue funds, it can be a medium severity issue. Players who were supposed to win in a game don't get their funds, but the EV doesn't change. The result is never uncovered. Hence medium.
+
+Because judges who approached this issue "by the book" would lose out on this outcome, this issue and duplicates will not count towards the judging contest reward calculation.
+
+@nevillehuang @nasri136 Please let me know whether, according to the above approach, #72 should be considered valid or not. It seems it presents another issue.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+ 
+The issue and duplicates will not be counted towards the judging payout.
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [gstoyanovbg](https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/136/#issuecomment-1804703228): accepted
+- [PlamenTSV](https://github.com/sherlock-audit/2023-10-looksrare-judging/issues/136/#issuecomment-1804713799): accepted
+
+**gstoyanovbg**
+
+@Czar102, allow me to disagree with the severity of the report. I'm not sure if I have the right to dispute it after the escalation is resolved, but here are my arguments:
+
+1) I agree that the funds can be rescued using emergencyWithdraw(). However, the funds locked in one iteration of the game are insignificant compared to the indirect losses from such an event. The success of luck-based games is directly tied to the trust of the players in the game creators. If the game is interrupted at a crucial moment (which is very likely), the affected players will certainly question the fairness of the game. Can they be sure that this is not intentionally caused for someone not to win the prize? The damage to the brand's reputation will be irreversible. In addition to the missed profits from hundreds of future iterations of the game, developers will incur losses from the funds invested in development.
+
+2) I mentioned earlier that when we talk about financial losses, we should also consider the losses for users from gas fees (may have thousands of players). We all know what the fees on the Ethereum mainnet can be, especially in moments of network congestion. For a player whose agent is wounded, it may be extremely important to heal it regardless of the fee paid. When funds are withdrawn through emergencyWithdraw() and returned to the players, they should be compensated for gas fees. These funds must be paid either by Looksrare or the players. In both cases, someone loses.
+
+3) The time lost by players to play a game that suddenly stops and cannot continue should also be taken into account. Even if the game starts again from the beginning and everything is fine, it cannot start from the same state it was interrupted. A player may have been in a position where they were likely to win a prize, but they probably won't be compensated for it. Even if they are, it will be at the protocol's expense.
+
+Considering 1), 2), and 3), my position is that there are much larger losses for each party than just the funds locked in the contract at the time of the interruption.
+
+**Czar102**
+
+> Can they be sure that this is not intentionally caused for someone not to win the prize?
+
+If that's the case, this could have been a high severity issue. I don't think that the report mentions such a scenario though.
+
+> The damage to the brand's reputation will be irreversible.
+
+That's true, but that is not a high severity vulnerability. A high severity vulnerability is when there is a direct and very probable loss of funds, which is not the case here.
+
+> These funds must be paid either by Looksrare or the players. In both cases, someone loses.
+
+The gas costs are out of scope here. The fact that the user plays the game is a "value gotten" for the gas. Anyway, even if, there would be no high severity impact because of gas.
+
+> A player may have been in a position where they were likely to win a prize, but they probably won't be compensated for it.
+
+We don't know that. Maybe the protocol would distribute the rewards proportionally to the EV of the players in a given position given an optimal strategy?
+
+This is why I chose a Medium severity for this issue.
+
+**gstoyanovbg**
+
+> If that's the case, this could have been a high severity issue. I don't think that the report mentions such a scenario though.
+
+Me and you know that this is not true, but for people which are not solidity developers / auditors it is not clear and creates reasonable doubt about the fairness of the game and its creators
+
+> That's true, but that is not a high severity vulnerability. A high severity vulnerability is when there is a direct and very probable loss of funds, which is not the case here.
+
+I agree there is no direct loss of funds but we have an issue that breaks core contract functionality, rendering the protocol/contract useless + indirect loss of funds on a large scale.
+
+> We don't know that. Maybe the protocol would distribute the rewards proportionally to the EV of the players in a given position given an optimal strategy?
+
+That would be the right decision. However, there is no way to do it in a good enough manner because there is no way to prove which player had what financial resources for the game. This is a very important variable for the potential mathematical model. For example, two agents who have survived until round X and have been healed three times will have equal weight if the game is interrupted at that moment. However, the player behind the first may no longer have the financial ability to heal the agent, while the second may be able to heal it three more times without any problem.
+
+
+**Czar102**
+
+> Me and you know that this is not true, but for people which are not solidity developers / auditors it is not clear and creates reasonable doubt about the fairness of the game and its creators
+
+This is exactly why we have this job. We need to tell them. And this impact doesn't seem to be the case here.
+
+> However, there is no way to do it in a good enough manner because there is no way to prove which player had what financial resources for the game.
+
+Yes, but I feel that's an insufficient impact to consider a high severity impact. In the end, they might make another contract and continue the game ;)
+Ofc that would be costly but the loss of funds is extremely limited here. This is why it's Medium.
+
+**0xhiroshi**
+
+https://github.com/LooksRare/contracts-infiltration/pull/165
+
+**SergeKireev**
+
+Fix LGTM
 
